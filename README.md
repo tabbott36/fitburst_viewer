@@ -35,31 +35,18 @@ Each burst is assumed to be centered in its file.
 ## Features
 
 - Previous / Next burst navigation
-- Dynamic spectrum
-- Time series
-- Frequency spectrum
+- Dynamic spectrum plot
+- Time series plot
+- Frequency spectrum plot
 - Interactive width selection
 - Interactive bandwidth selection
 - Time downsampling
 - Frequency downsampling
+- Reset chosen parameters
+- Zoom in/out
+- Zoom reset
 - DM adjustment
-- Per-burst notes
-- Automatic `frb_viewer_results.json`
-- CSV export can be added/used from the application code
-
-### Width selection
-
-Click **Width Selection**, then drag horizontally across the burst in the
-time-series panel. The selection is also shown as vertical lines on the
-dynamic spectrum.
-
-### Bandwidth selection
-
-Click **Bandwidth Selection**, then drag vertically across the burst in the
-frequency-spectrum panel. The selection is also shown as horizontal lines on
-the dynamic spectrum.
-
-Click **Accept Selection** when finished.
+- Customized burst notes
 
 ## Output
 
