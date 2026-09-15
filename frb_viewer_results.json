@@ -1,0 +1,15 @@
+{
+  "test_burst.npy": {
+    "file": "test_burst.npy",
+    "dm": -0.2,
+    "time_downsample": 16,
+    "freq_downsample": 8,
+    "width_start": 149.56658570793283,
+    "width_end": 209.84948517086855,
+    "width": 964.5263914069715,
+    "band_start": 1.4676330651400207,
+    "band_end": 123.5145249883955,
+    "bandwidth": 976.3751353860438,
+    "note": "Multi-component"
+  }
+}

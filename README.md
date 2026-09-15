@@ -1,63 +1,135 @@
-# fitburst — Initial Guess GUI
+# FRB Viewer
 
-A standalone, browser-based viewer for setting initial parameter guesses
-before running fitburst on your fast radio burst data.
+A small Python/PySide6 GUI for browsing `.npy` fast-radio-burst dynamic spectra.
 
-## Usage
-
-Just open the HTML file in any modern browser — no server or dependencies required:
+## Install
 
 ```bash
-open fitburst_initial_guess.html          # macOS
-xdg-open fitburst_initial_guess.html     # Linux
-start fitburst_initial_guess.html        # Windows
+python -m pip install numpy matplotlib PySide6
 ```
 
-## Workflow
+## Run
 
-1. **Step 1 — Arrival time**: Move your mouse over the dynamic spectrum.
-   A green dashed line tracks your cursor. Click to lock in the arrival time.
+```bash
+python frb_viewer.py /path/to/directory
+```
 
-2. **Step 2 — Width**: Click and drag horizontally across the burst to define
-   the pulse width (σ). The yellow shaded region shows the selected interval.
+Or simply:
 
-3. **Step 3 — Copy output**: The dictionary in the output panel updates live.
-   Click "Copy to clipboard" to grab the JSON for use in your fitburst call.
+```bash
+python frb_viewer.py
+```
 
-## Plugging in real data
+and choose a directory from the GUI.
 
-In the `<script>` section of the HTML, replace the `genDynspec()` function
-with your own data. The array should have shape `[n_freq][n_time]` with
-values normalised to [0, 1]:
+The directory should contain `.npy` files with shape:
 
-```javascript
-// Replace genDynspec() with something like:
-function genDynspec() {
-  // dynspec is your [n_freq x n_time] array, values in [0, 1]
-  const rows = dynspec.length;
-  const cols  = dynspec[0].length;
-  return { data: dynspec, rows, cols };
+```text
+(n_frequency, n_time)
+```
+
+Each burst is assumed to be centered in its file.
+
+## Features
+
+- Previous / Next burst navigation
+- Dynamic spectrum
+- Time series
+- Frequency spectrum
+- Interactive width selection
+- Interactive bandwidth selection
+- Time downsampling
+- Frequency downsampling
+- DM adjustment
+- Per-burst notes
+- Automatic `frb_viewer_results.json`
+- CSV export can be added/used from the application code
+
+### Width selection
+
+Click **Width Selection**, then drag horizontally across the burst in the
+time-series panel. The selection is also shown as vertical lines on the
+dynamic spectrum.
+
+### Bandwidth selection
+
+Click **Bandwidth Selection**, then drag vertically across the burst in the
+frequency-spectrum panel. The selection is also shown as horizontal lines on
+the dynamic spectrum.
+
+Click **Accept Selection** when finished.
+
+## Integrating your existing scripts
+
+Put `downsample.py` and `dedisperse.py` beside `frb_viewer.py`.
+
+The application looks for common function names such as:
+
+```python
+downsample_time(array, factor)
+downsample_freq(array, factor)
+dedisperse(array, dm)
+```
+
+The adapter functions are near the top of `frb_viewer.py`:
+
+- `run_time_downsample`
+- `run_freq_downsample`
+- `run_dedisperse`
+
+If your current functions have different signatures, edit those three adapters.
+
+The GUI expects `dedisperse` to return either:
+
+```python
+array
+```
+
+or preferably:
+
+```python
+array, optimized_dm
+```
+
+It also accepts a dictionary containing the array and DM.
+
+If no compatible external function is found, time/frequency downsampling uses
+simple NumPy block averaging. DM adjustment falls back to leaving the array
+unchanged and recording the supplied DM. The status bar indicates whether the
+external script or fallback was used.
+
+## Output
+
+The application automatically writes:
+
+```text
+frb_viewer_results.json
+```
+
+into the selected burst directory.
+
+Example:
+
+```json
+{
+  "burst_001.npy": {
+    "file": "burst_001.npy",
+    "dm": 218.184,
+    "initial_dm": 219.5,
+    "time_downsample": 8,
+    "freq_downsample": 4,
+    "width_start": 12340.0,
+    "width_end": 12355.0,
+    "width": 15.0,
+    "band_start": 420.0,
+    "band_end": 850.0,
+    "bandwidth": 430.0,
+    "note": "Clean burst"
+  }
 }
 ```
 
-If you're loading data from a file, you can use a small Python helper to
-export your numpy array as JSON and fetch it in the browser:
-
-```python
-import numpy as np, json
-dynspec = ...  # your (n_freq, n_time) array
-normed  = (dynspec - dynspec.min()) / dynspec.ptp()
-with open('dynspec.json', 'w') as f:
-    json.dump(normed.tolist(), f)
-```
-
-Then in the HTML, replace the `genDynspec()` call with a `fetch('dynspec.json')`
-and re-render on load.
-
-## Output format
-
-```json
-{"arrival_time": 84.5000, "width": 12.3000}
-```
-
-Units are milliseconds, matching the fitburst convention for `t0` and `sigma`.
+The width and bandwidth are currently recorded in **time samples** and
+**frequency-channel indices**, because a bare `.npy` array contains no physical
+time/frequency metadata. If your project has known `tsamp`, channel width, and
+frequency ordering, those can be added easily.
