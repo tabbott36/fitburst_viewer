@@ -1,6 +1,6 @@
 # FRB Viewer
 
-A small Python/PySide6 GUI for browsing `.npy` fast-radio-burst dynamic spectra.
+A small Python GUI for viewing and analyzing `.npy` fast-radio-burst data. 
 
 ![FRB Viewer user interface](user_interface.png)
 
