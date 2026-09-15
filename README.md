@@ -2,6 +2,8 @@
 
 A small Python/PySide6 GUI for browsing `.npy` fast-radio-burst dynamic spectra.
 
+![FRB Viewer user interface](user_interface.png)
+
 ## Install
 
 ```bash
