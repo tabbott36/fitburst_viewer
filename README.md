@@ -51,3 +51,6 @@ Each burst is assumed to be centered in its file.
 ## Output
 
 The application writes everything to a dictionary that used the burst's file name as a key and stores all of the inputted parameters as values. See the ![frb_viewer_results.json](frb_viewer_results.json) for an example. 
+
+## Feedback
+Any questions can be directed to Thomas Abbott: thomas.abbott@mail.mcgill.ca. This repo made use of generative AI. 
