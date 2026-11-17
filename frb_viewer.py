@@ -35,15 +35,23 @@ status bar.
 
 from __future__ import annotations
 
+import argparse
+import copy
 import csv
 import importlib.util
 import json
+import re
 import sys
-import copy
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+try:
+    from scipy.optimize import curve_fit
+except Exception:  # pragma: no cover - optional dependency
+    curve_fit = None
+
+from fluxcal import fluxcal
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -144,6 +152,93 @@ def _extract_float(result):
 
     return None
 
+
+def build_fitburst_generic_input(
+    data_full: np.ndarray,
+    *,
+    dm: float = 0.0,
+    res_time: float = 40.96e-6,
+    res_freq: float = 0.390625,
+    freqs_bin0: float = 400.0,
+    bad_chans: Optional[list[int]] = None,
+    is_dedispersed: bool = False,
+    arrival_time: Any = 0.0,
+    ref_freq: float = 400.0,
+    width_seconds: Optional[Any] = None,
+    amplitude: Optional[Any] = None,
+):
+    """Build the fitburst-generic payload expected by fitburst backend DataReader."""
+    data = np.asarray(data_full, dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f"Expected a 2-D dynamic spectrum, got shape {data.shape!r}")
+
+    num_freq, num_time = data.shape
+    if bad_chans is None:
+        bad_chans = []
+    else:
+        bad_chans = [int(ch) for ch in bad_chans]
+
+    metadata = {
+        "bad_chans": bad_chans,
+        "freqs_bin0": float(freqs_bin0),
+        "is_dedispersed": bool(is_dedispersed),
+        "num_freq": int(num_freq),
+        "num_time": int(num_time),
+        "times_bin0": 0.0,
+        "res_freq": float(res_freq),
+        "res_time": float(res_time),
+    }
+
+    # Accept either a single arrival/width or lists for multi-component bursts.
+    if isinstance(arrival_time, (list, tuple, np.ndarray)):
+        arrivals = [float(a) for a in arrival_time]
+    else:
+        arrivals = [float(arrival_time)]
+
+    if width_seconds is None:
+        # Default width: at least one sample, or the whole duration if that's larger.
+        default_width = max(float(num_time) * float(res_time), float(res_time))
+        widths = [default_width] * len(arrivals)
+    elif isinstance(width_seconds, (list, tuple, np.ndarray)):
+        widths = [float(w) for w in width_seconds]
+    else:
+        widths = [float(width_seconds)] * len(arrivals)
+
+    if amplitude is None:
+        amplitude_values = [float(np.log10(np.nanmax(np.abs(data)) + 1e-9)) for _ in arrivals]
+    elif isinstance(amplitude, (list, tuple, np.ndarray)):
+        amplitude_values = [float(a) for a in amplitude]
+    else:
+        amplitude_values = [float(amplitude) for _ in arrivals]
+
+    # Ensure lengths match
+    if len(widths) != len(arrivals):
+        # If a single width provided for multiple arrivals, broadcast it.
+        if len(widths) == 1:
+            widths = widths * len(arrivals)
+        else:
+            raise ValueError("Length of arrival_time and width_seconds must match")
+    if len(amplitude_values) != len(arrivals):
+        if len(amplitude_values) == 1:
+            amplitude_values = amplitude_values * len(arrivals)
+        else:
+            raise ValueError("Length of amplitude does not match arrival_time")
+
+    burst_parameters = {
+        "amplitude": amplitude_values,
+        "arrival_time": [float(a) for a in arrivals],
+        "burst_width": [float(w) for w in widths],
+        "dm": [float(dm) for _ in arrivals],
+        "dm_index": [-2.0 for _ in arrivals],
+        "ref_freq": [float(ref_freq) for _ in arrivals],
+        "scattering_index": [0.0 for _ in arrivals],
+        "scattering_timescale": [0.0 for _ in arrivals],
+        "spectral_index": [-2.0 for _ in arrivals],
+        "spectral_running": [0.0 for _ in arrivals],
+    }
+    return data, metadata, burst_parameters
+
+
 def downsample_array2d(array2d, downsample_factor_row=1, downsample_factor_col=1):
     """
     Downsample/average the rows of the 2D array by a factor of downsample_factor_row, and downsample/average the columns
@@ -196,41 +291,10 @@ def downsample_array2d(array2d, downsample_factor_row=1, downsample_factor_col=1
     return arr
 
 def dedisperse_incoherent(dyn_spec, dm, tsamp, df, k=(1.0/0.000241)):
+    """Compatibility shim retained for older callers. This viewer intentionally does not
+    perform dedispersion because the feature is not reliable for the loaded data.
     """
-    Incoherently dedisperse the channelized filterbank data at the specified DM.
-
-    Parameters
-    ----------
-    dyn_spec: Input dynamic spectrum.
-    dm: Dispersion measure to use for dedispersion (pc cm^-3).
-    tsamp: Time resolution (s).
-    df: Channel width of each filterbank channel (MHz).
-    k: Dispersion measure constant (k = 1.0 / 0.000241 is the standard value used in the PSR community).
-
-    Returns
-    -------
-    dyn_spec_dedispersed: Dedispersed output dynamic spectrum.
-    dm: The dispersion measure used for dedispersion.
-    """
-
-    freq_hi = 800.0 # MHz
-    freq_lo = freq_hi
-
-    dyn_spec_dedispersed = copy.deepcopy(dyn_spec)
-    
-    nchans, nsamples = dyn_spec.shape
-
-    for chan_idx in np.arange(0, nchans, 1):
-        tau = np.multiply(k, np.multiply(dm, np.subtract(np.divide(1.0, np.power(freq_lo, 2.0)),
-                                                         np.divide(1.0, np.power(freq_hi, 2.0)))))
-
-        num_samples = int(np.round(np.divide(-tau, tsamp)))
-        dyn_spec_dedispersed[chan_idx, :] = np.roll(dyn_spec_dedispersed[chan_idx, :], num_samples, axis=0)
-
-        if (chan_idx < (nchans - 1)):
-            freq_lo = np.subtract(freq_lo, np.abs(df))
-
-    return dyn_spec_dedispersed, dm
+    return np.asarray(dyn_spec, dtype=float), dm
 
 
 # ---------------------------------------------------------------------------
@@ -340,12 +404,30 @@ class PlotCanvas(FigureCanvas):
 
 
 class FRBViewer(QMainWindow):
-    def __init__(self, directory: Optional[str] = None):
+    DEFAULT_DM = 219.456
+
+    @staticmethod
+    def _is_bad_note(note: Any) -> bool:
+        return str(note).strip().lower() == "bad"
+
+    @staticmethod
+    def _is_duplicate_note(note: Any) -> bool:
+        return str(note).strip().lower() == "duplicate"
+
+    def _is_excluded_note(self, note: Any) -> bool:
+        return (
+            (self.no_bad and self._is_bad_note(note))
+            or (self.no_dups and self._is_duplicate_note(note))
+        )
+
+    def __init__(self, directory: Optional[str] = None, *, no_bad: bool = False, no_dups: bool = False):
         super().__init__()
 
         self.setWindowTitle("FRB Viewer")
         self.resize(1400, 1000)
 
+        self.no_bad = no_bad
+        self.no_dups = no_dups
         self.directory: Optional[Path] = None
         self.files: list[Path] = []
         self.index = 0
@@ -355,11 +437,13 @@ class FRBViewer(QMainWindow):
 
         # Per-burst metadata.
         self.results: dict[str, dict[str, Any]] = {}
+        self._all_results: dict[str, dict[str, Any]] = {}
 
         # Current processing state.
-        self.current_dm: Optional[float] = 219.456
-        self.time_factor = 1
-        self.freq_factor = 1
+        self.current_dm: Optional[float] = self.DEFAULT_DM
+        # Default downsampling: time x16, frequency x4
+        self.time_factor = 16
+        self.freq_factor = 4
 
         # Physical resolutions: one frequency channel and one time sample.
         # Frequency units are assumed to be MHz unless you change the label.
@@ -372,6 +456,11 @@ class FRBViewer(QMainWindow):
         self.width_end: Optional[float] = None
         self.band_start: Optional[float] = None
         self.band_end: Optional[float] = None
+
+        # Last Gaussian fit results (stored to include in saved results).
+        self._last_gaussian_fit: Optional[dict[str, Any]] = None
+        # Multi-component fits: list of {'arrival_time': float, 'sigma_seconds': float}
+        self._components: list[dict[str, float]] = []
 
         self._build_ui()
 
@@ -413,8 +502,11 @@ class FRBViewer(QMainWindow):
         self.previous_button.clicked.connect(self.previous_burst)
         self.next_button.clicked.connect(self.next_burst)
 
-        self.position_label = QLabel("0 / 0")
+        self.position_label = QLineEdit("0 / 0")
         self.position_label.setAlignment(Qt.AlignCenter)
+        self.position_label.setMaximumWidth(120)
+        self.position_label.returnPressed.connect(self.go_to_position_from_text)
+        self.position_label.editingFinished.connect(self.go_to_position_from_text)
 
         nav.addWidget(self.previous_button)
         nav.addWidget(self.position_label)
@@ -448,6 +540,14 @@ class FRBViewer(QMainWindow):
         selection.addWidget(self.width_button)
         selection.addWidget(self.band_button)
         selection.addWidget(self.accept_button)
+        # Fit Gaussian button: measure TOA and width with uncertainties.
+        self.fit_button = QPushButton("Fit Gaussian")
+        self.fit_button.clicked.connect(self.fit_gaussian)
+        selection.addWidget(self.fit_button)
+        # Add Component: append the last fit as an additional burst component
+        self.add_component_button = QPushButton("Add Component")
+        self.add_component_button.clicked.connect(self.add_component)
+        selection.addWidget(self.add_component_button)
         selection.addWidget(self.reset_button)
         selection.addWidget(self.zoom_in_button)
         selection.addWidget(self.zoom_out_button)
@@ -460,7 +560,7 @@ class FRBViewer(QMainWindow):
         processing.addWidget(QLabel("Time downsample:"))
         self.time_spin = QSpinBox()
         self.time_spin.setRange(1, 100000)
-        self.time_spin.setValue(1)
+        self.time_spin.setValue(16)
         processing.addWidget(self.time_spin)
 
         self.time_button = QPushButton("Downsample Time")
@@ -470,7 +570,7 @@ class FRBViewer(QMainWindow):
         processing.addWidget(QLabel("Freq. downsample:"))
         self.freq_spin = QSpinBox()
         self.freq_spin.setRange(1, 100000)
-        self.freq_spin.setValue(1)
+        self.freq_spin.setValue(4)
         processing.addWidget(self.freq_spin)
 
         self.freq_button = QPushButton("Downsample Freq.")
@@ -510,16 +610,26 @@ class FRBViewer(QMainWindow):
         self.note_button.clicked.connect(self.save_note)
         notes.addWidget(self.note_button)
 
+        self.export_fitburst_button = QPushButton("Export fitburst .npz")
+        self.export_fitburst_button.clicked.connect(self.export_fitburst_npz)
+        notes.addWidget(self.export_fitburst_button)
+
+        self.fluxcal_button = QPushButton("Fluxcal")
+        self.fluxcal_button.clicked.connect(self.run_fluxcal)
+        notes.addWidget(self.fluxcal_button)
+
         root.addLayout(notes)
 
         # Measurement/status row.
         status = QHBoxLayout()
         self.width_label = QLabel("Width: —")
         self.band_label = QLabel("Bandwidth: —")
+        self.fit_label = QLabel("Fit: —")
         self.processing_label = QLabel("")
 
         status.addWidget(self.width_label)
         status.addWidget(self.band_label)
+        status.addWidget(self.fit_label)
         status.addWidget(self.processing_label, 1)
 
         root.addLayout(status)
@@ -556,16 +666,57 @@ class FRBViewer(QMainWindow):
 
         self.directory = directory
         self.files = files
-        self.index = 0
 
+        if self.no_bad or self.no_dups:
+            path = self._results_path()
+            excluded_names = set()
+            if path is not None and path.exists():
+                try:
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        excluded_names = {
+                            key
+                            for key, value in loaded.items()
+                            if isinstance(value, dict) and self._is_excluded_note(value.get("note"))
+                        }
+                except (OSError, json.JSONDecodeError):
+                    pass
+            self.files = [p for p in files if p.name not in excluded_names]
+
+        self.index = 0
         self._load_results()
+
+        if not self.files:
+            filter_names = []
+            if self.no_bad:
+                filter_names.append("--no-bad")
+            if self.no_dups:
+                filter_names.append("--no-dups")
+            filter_text = " / ".join(filter_names) if filter_names else "the current filter"
+            QMessageBox.warning(
+                self,
+                "No valid bursts",
+                f"All .npy files in {directory} were excluded by the {filter_text} filter.",
+            )
+            return
+
         self.load_burst(0)
 
         self.dir_label.setText(str(directory))
 
+    def _dm_delta_from_spin(self) -> float:
+        return float(self.dm_spin.value()) if self.dm_spin is not None else 0.0
+
+    def _dm_total_for_results(self) -> float:
+        return float(self.DEFAULT_DM + self._dm_delta_from_spin())
+
+    def _set_dm_spin_from_total(self, total_dm: float):
+        self.dm_spin.setValue(float(total_dm) - self.DEFAULT_DM)
+
     def _load_results(self):
         """Load previously saved per-burst metadata from results JSON."""
         self.results = {}
+        self._all_results = {}
         path = self._results_path()
         if path is None or not path.exists():
             return
@@ -573,7 +724,14 @@ class FRBViewer(QMainWindow):
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
-                self.results = loaded
+                self._all_results = loaded
+                self.results = {}
+                for key, value in loaded.items():
+                    if not isinstance(value, dict):
+                        self.results[key] = value
+                        continue
+                    if not self._is_excluded_note(value.get("note")):
+                        self.results[key] = value
         except (OSError, json.JSONDecodeError) as exc:
             # A corrupt/partial results file should not prevent the bursts
             # themselves from being viewed.
@@ -615,19 +773,45 @@ class FRBViewer(QMainWindow):
         entry = self.results.get(path.name, {})
 
         self.current_dm = entry.get("dm")
-        self.time_factor = int(entry.get("time_downsample", 1) or 1)
-        self.freq_factor = int(entry.get("freq_downsample", 1) or 1)
+        # Use stored values when present, otherwise fall back to new defaults
+        self.time_factor = int(entry.get("time_downsample", 16) or 16)
+        self.freq_factor = int(entry.get("freq_downsample", 4) or 4)
 
         self.width_start = entry.get("width_start")
         self.width_end = entry.get("width_end")
         self.band_start = entry.get("band_start")
         self.band_end = entry.get("band_end")
+        self._last_gaussian_fit = entry.get("gaussian_fit")
+        # Load any previously saved components for this burst
+        comps = entry.get("components", [])
+        if isinstance(comps, list):
+            cleaned = []
+            for c in comps:
+                if not isinstance(c, dict):
+                    continue
+                try:
+                    component = {
+                        "arrival_time": float(c.get("arrival_time")) if "arrival_time" in c else None,
+                        "sigma_seconds": float(c.get("sigma_seconds")) if "sigma_seconds" in c else None,
+                    }
+                    for key in ("amplitude", "amplitude_err", "arrival_time_err", "sigma_seconds_err", "baseline", "baseline_err"):
+                        if key in c:
+                            component[key] = c[key]
+                    if "gaussian_fit" in c:
+                        component["gaussian_fit"] = c["gaussian_fit"]
+                except Exception:
+                    continue
+                if component.get("arrival_time") is not None and component.get("sigma_seconds") is not None:
+                    cleaned.append(component)
+            self._components = cleaned
+        else:
+            self._components = []
 
         self.time_spin.setValue(self.time_factor)
         self.freq_spin.setValue(self.freq_factor)
 
         if self.current_dm is not None:
-            self.dm_spin.setValue(float(self.current_dm))
+            self._set_dm_spin_from_total(float(self.current_dm))
         else:
             self.dm_spin.setValue(0.0)
 
@@ -656,7 +840,7 @@ class FRBViewer(QMainWindow):
         if self.freq_factor > 1:
             arr = downsample_array2d(arr, downsample_factor_row=self.freq_factor)
 
-        self.current_array = arr
+        self.current_array = np.asarray(arr)
 
     # ------------------------------------------------------------------
     # Plotting
@@ -818,6 +1002,68 @@ class FRBViewer(QMainWindow):
             line = self.canvas.ax_freq.axhline(self.band_end, linestyle="--", color="red")
             line._frb_guide = True
 
+        # Plot each fitted component on the time-profile if available.
+        component_fits = list(self._components) if self._components else []
+        if self._last_gaussian_fit is not None and not component_fits:
+            component_fits = [self._last_gaussian_fit]
+
+        if component_fits and self.current_array is not None:
+            try:
+                nfreq, ntime = self.current_array.shape
+                time_factor = max(1, int(self.time_factor))
+                t_samples = np.arange(ntime)
+
+                profile = np.nanmean(self.current_array, axis=0)
+                baseline_profile = float(np.nanpercentile(profile, 10)) if np.size(profile) else 0.0
+                profile_min = float(np.nanmin(profile)) if np.size(profile) else 0.0
+                profile_max = float(np.nanmax(profile)) if np.size(profile) else 1.0
+
+                colors = ["lime", "cyan", "magenta", "orange", "gold"]
+                for idx, fit in enumerate(component_fits):
+                    A = fit.get("amplitude")
+                    mu = fit.get("arrival_time")
+                    sigma = fit.get("sigma_seconds")
+                    baseline = fit.get("baseline") if fit.get("baseline") is not None else baseline_profile
+
+                    if mu is None or sigma is None:
+                        continue
+                    if float(sigma) <= 0:
+                        continue
+
+                    mu_sample = float(mu) / (self.time_resolution * time_factor)
+                    sigma_sample = float(sigma) / (self.time_resolution * time_factor)
+
+                    if not np.isfinite(mu_sample) or not np.isfinite(sigma_sample):
+                        continue
+
+                    if A is not None:
+                        amplitude = float(A)
+                    else:
+                        # Infer amplitude directly from the burst profile so the
+                        # Gaussian stays in the same units as the visible time series.
+                        half_width = max(1, int(np.ceil(3.0 * sigma_sample)))
+                        lo = max(0, int(np.floor(mu_sample - half_width)))
+                        hi = min(len(t_samples), int(np.ceil(mu_sample + half_width)))
+                        local_profile = profile[lo:hi]
+                        if local_profile.size:
+                            amplitude = float(np.max(local_profile) - baseline)
+                        else:
+                            amplitude = max(profile_max - baseline, 1e-6)
+
+                    gauss = float(baseline) + max(amplitude, 0.0) * np.exp(-0.5 * ((t_samples - mu_sample) / sigma_sample) ** 2)
+
+                    color = colors[idx % len(colors)]
+                    line, = self.canvas.ax_time.plot(t_samples, gauss, color=color, linewidth=1.5, alpha=0.8)
+                    line._frb_guide = True
+
+                    vline = self.canvas.ax_time.axvline(mu_sample, linestyle=":", color=color, alpha=0.9)
+                    vline._frb_guide = True
+                    vline2 = self.canvas.ax_dyn.axvline(mu_sample, linestyle=":", color=color, alpha=0.9)
+                    vline2._frb_guide = True
+            except Exception:
+                # Non-fatal: plotting the fit should not break the viewer.
+                pass
+
     # ------------------------------------------------------------------
     # Navigation
     # ------------------------------------------------------------------
@@ -831,6 +1077,51 @@ class FRBViewer(QMainWindow):
         self._save_current_state()
         if self.index > 0:
             self.load_burst(self.index - 1)
+
+    def go_to_position_from_text(self):
+        if not self.files:
+            return
+
+        text = self.position_label.text().strip()
+        if not text:
+            self._update_labels()
+            return
+
+        value_text = text.replace(" ", "")
+        if "/" in value_text:
+            left, right = value_text.split("/", 1)
+            if left and right:
+                try:
+                    target_index = int(left) - 1
+                    total_files = int(right)
+                except ValueError:
+                    self._update_labels()
+                    return
+            else:
+                self._update_labels()
+                return
+        else:
+            try:
+                target_index = int(value_text) - 1
+                total_files = len(self.files)
+            except ValueError:
+                self._update_labels()
+                return
+
+        if total_files <= 0:
+            self._update_labels()
+            return
+
+        if target_index < 0:
+            target_index = 0
+        elif target_index >= len(self.files):
+            target_index = len(self.files) - 1
+
+        if target_index != self.index:
+            self._save_current_state()
+            self.load_burst(target_index)
+        else:
+            self._update_labels()
 
     # ------------------------------------------------------------------
     # Width / bandwidth selection
@@ -966,12 +1257,17 @@ class FRBViewer(QMainWindow):
 
         # Clear DM and downsampling
         self.current_dm = None
-        self.time_factor = 1
-        self.freq_factor = 1
+        # Restore to new defaults
+        self.time_factor = 16
+        self.freq_factor = 4
+
+        # Clear any previously added multi-component fits.
+        self._components = []
+        self._last_gaussian_fit = None
 
         # Reset UI controls
-        self.time_spin.setValue(1)
-        self.freq_spin.setValue(1)
+        self.time_spin.setValue(16)
+        self.freq_spin.setValue(4)
         self.dm_spin.setValue(0.0)
 
         # Restore original data
@@ -998,13 +1294,8 @@ class FRBViewer(QMainWindow):
 
         factor = self.time_spin.value()
         try:
-            arr = downsample_array2d(self.original_array, downsample_factor_col=factor)
-
-            if self.freq_factor > 1:
-                arr = downsample_array2d(arr, downsample_factor_row=self.freq_factor)
-
-            self.current_array = arr
             self.time_factor = factor
+            self._rebuild_current_array()
             self._plot()
             self._save_current_state()
 
@@ -1024,15 +1315,8 @@ class FRBViewer(QMainWindow):
 
         factor = self.freq_spin.value()
         try:
-            arr = self.original_array.copy()
-
-            if self.time_factor > 1:
-                arr = downsample_array2d(arr, downsample_factor_col=self.time_factor)
-
-            arr = downsample_array2d(arr, downsample_factor_row=factor)
-
-            self.current_array = arr
             self.freq_factor = factor
+            self._rebuild_current_array()
             self._plot()
             self._save_current_state()
 
@@ -1047,38 +1331,161 @@ class FRBViewer(QMainWindow):
             )
 
     def adjust_dm(self):
+        """DM correction is intentionally disabled because the dedispersion code is not reliable."""
         if self.original_array is None:
             return
 
-        dm = self.dm_spin.value()
+        self.current_dm = self._dm_total_for_results()
+        self._rebuild_current_array()
+        self._set_dm_spin_from_total(float(self.current_dm))
+        self._plot()
+        self._save_current_state()
 
+        self.processing_label.setText("DM adjustment: disabled (dedispersion removed)")
+        self.statusBar().showMessage("DM correction disabled; raw data is displayed.")
+
+    def fit_gaussian(self):
+        """Fit a Gaussian + constant baseline to the time-profile and record results.
+
+        Uses SciPy's `curve_fit` when available; otherwise falls back to
+        moment-based estimates without uncertainties.
+        """
+        if self.current_array is None:
+            return
+
+        data = np.asarray(self.current_array)
+        nfreq, ntime = data.shape
+        ts = np.nanmean(data, axis=0)
+
+        # Use selected width if present, otherwise full range.
+        if self.width_start is not None and self.width_end is not None:
+            start = int(max(0, np.floor(self.width_start)))
+            end = int(min(ntime - 1, np.ceil(self.width_end)))
+        else:
+            start = 0
+            end = ntime - 1
+
+        if end <= start:
+            QMessageBox.warning(self, "Fit failed", "Invalid width selection for fitting.")
+            return
+
+        inds = np.arange(start, end + 1)
+        profile = ts[start : end + 1]
+
+        # Physical time axis in seconds (account for downsampling factor)
+        time_factor = max(1, int(self.time_factor))
+        t = inds * self.time_resolution * time_factor
+
+        # Baseline estimate and initial guesses
+        baseline0 = float(np.nanpercentile(profile, 10))
+        amp0 = float(np.nanmax(profile) - baseline0)
+        mu0 = float((start + end) / 2.0 * self.time_resolution * time_factor)
+        sigma0 = float(max(1.0, (end - start) / 6.0) * self.time_resolution * time_factor)
+
+        result: dict[str, Any] = {}
+
+        if curve_fit is not None:
+            def _gauss(x, A, mu, sigma, c):
+                return A * np.exp(-0.5 * ((x - mu) / sigma) ** 2) + c
+
+            p0 = [amp0, mu0, sigma0, baseline0]
+            try:
+                popt, pcov = curve_fit(_gauss, t, profile, p0=p0, maxfev=20000)
+                perr = np.sqrt(np.diag(pcov)) if pcov is not None else [None] * len(popt)
+
+                A, mu, sigma, c = popt
+                A_err, mu_err, sigma_err, c_err = perr
+
+                result = {
+                    "amplitude": float(A),
+                    "amplitude_err": float(A_err) if A_err is not None else None,
+                    "arrival_time": float(mu),
+                    "arrival_time_err": float(mu_err) if mu_err is not None else None,
+                    "sigma_seconds": float(abs(sigma)),
+                    "sigma_seconds_err": float(abs(sigma_err)) if sigma_err is not None else None,
+                    "baseline": float(c),
+                    "baseline_err": float(c_err) if c_err is not None else None,
+                }
+            except Exception as exc:
+                # Fall back to moments if curve_fit fails
+                curve_fit_failed = True
+        else:
+            curve_fit_failed = True
+
+        if 'result' not in locals() or (not result and 'curve_fit_failed' in locals() and curve_fit_failed):
+            # Moment-based estimates (no uncertainties)
+            prof_nonneg = profile - baseline0
+            prof_nonneg = np.where(prof_nonneg > 0, prof_nonneg, 0.0)
+            denom = prof_nonneg.sum()
+            if denom <= 0:
+                QMessageBox.warning(self, "Fit failed", "Profile contains no positive signal for fitting.")
+                return
+            mu = float((t * prof_nonneg).sum() / denom)
+            var = float((prof_nonneg * (t - mu) ** 2).sum() / denom)
+            sigma = float(np.sqrt(var))
+
+            result = {
+                "amplitude": float(profile.max()),
+                "amplitude_err": None,
+                "arrival_time": mu,
+                "arrival_time_err": None,
+                "sigma_seconds": sigma,
+                "sigma_seconds_err": None,
+                "baseline": float(baseline0),
+                "baseline_err": None,
+            }
+
+        # Save and display
+        self._last_gaussian_fit = result
+        # Keep last fit available; do not automatically add to components.
+        self._save_current_state()
+        self._plot()
+        self._update_labels()
+
+        # Friendly processing label
+        at_ms = result["arrival_time"] * 1000.0
+        at_err_ms = (result.get("arrival_time_err") * 1000.0) if result.get("arrival_time_err") else None
+        wid_ms = result["sigma_seconds"] * 1000.0
+        wid_err_ms = (result.get("sigma_seconds_err") * 1000.0) if result.get("sigma_seconds_err") else None
+
+        parts = [f"TOA: {at_ms:.4g} ms"]
+        if at_err_ms is not None:
+            parts[0] += f" ± {at_err_ms:.3g} ms"
+        parts.append(f"Width(σ): {wid_ms:.4g} ms")
+        if wid_err_ms is not None:
+            parts[1] += f" ± {wid_err_ms:.3g} ms"
+
+        self.processing_label.setText("; ".join(parts))
+        self.statusBar().showMessage("Gaussian fit complete.")
+
+    def add_component(self):
+        """Append the last Gaussian fit as an additional component for multi-component exports."""
+        if self._last_gaussian_fit is None:
+            QMessageBox.warning(self, "No fit available", "No Gaussian fit available to add as a component.")
+            return
+
+        fit = dict(self._last_gaussian_fit)
         try:
-            # Start from original data, then apply DM processing and the
-            # selected downsampling factors.
-            arr, optimized_dm = dedisperse_incoherent(self.original_array, dm, tsamp=self.time_resolution, df=self.freq_resolution)
+            at = float(fit.get("arrival_time"))
+            sig = float(fit.get("sigma_seconds"))
+        except Exception:
+            QMessageBox.warning(self, "Invalid fit", "The last fit does not contain valid arrival/width information.")
+            return
 
-            self.current_dm = optimized_dm if optimized_dm is not None else dm
+        component = {
+            "arrival_time": at,
+            "sigma_seconds": sig,
+            "gaussian_fit": fit,
+        }
+        for key in ("amplitude", "amplitude_err", "arrival_time_err", "sigma_seconds_err", "baseline", "baseline_err"):
+            if key in fit:
+                component[key] = fit[key]
 
-            if self.time_factor > 1:
-                arr = downsample_array2d(arr, downsample_factor_col=self.time_factor)
-            if self.freq_factor > 1:
-                arr = downsample_array2d(arr, downsample_factor_row=self.freq_factor)
-
-            self.current_array = np.asarray(arr)
-
-            self.dm_spin.setValue(float(self.current_dm))
-            self._plot()
-            self._save_current_state()
-
-            source = "dedisperse_incoherent (built-in)"
-            self.processing_label.setText(f"DM adjustment: {self.current_dm:.6f} ({source})")
-            self.statusBar().showMessage("DM adjustment complete.")
-        except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "DM adjustment failed",
-                str(exc),
-            )
+        self._components.append(component)
+        self._save_current_state()
+        self._plot()
+        self._update_labels()
+        self.statusBar().showMessage(f"Added component: TOA={at:.6g} s, σ={sig:.6g} s")
 
     # ------------------------------------------------------------------
     # Notes and output
@@ -1112,21 +1519,119 @@ class FRBViewer(QMainWindow):
             band_display = abs(self.band_end - self.band_start)
             bandwidth = float(band_display * max(1, int(self.freq_factor)))
 
-        self.results[filename] = {
+        gaussian_fit = self._last_gaussian_fit or {}
+        dm_total = self._dm_total_for_results()
+
+        entry = {
             "file": filename,
-            "dm": self.current_dm,
+            "dm": dm_total,
             "time_downsample": self.time_factor,
             "freq_downsample": self.freq_factor,
             "width_start": self.width_start,
             "width_end": self.width_end,
-            "width": width,
+            "selection_width": width,
             "band_start": self.band_start,
             "band_end": self.band_end,
             "bandwidth": bandwidth,
             "note": self.note_edit.text(),
+            "gaussian_fit": gaussian_fit,
+            "components": self._components,
         }
 
+        self.results[filename] = entry
+        self._all_results[filename] = entry
+
         self._write_results()
+
+    def _metadata_search_roots(self):
+        roots = []
+        if self.directory is not None:
+            roots.append(Path(self.directory).resolve())
+            roots.append(Path(self.directory).resolve().parent)
+        roots.append(Path(__file__).resolve().parent)
+        seen = set()
+        ordered = []
+        for root in roots:
+            normalized = str(root)
+            if normalized not in seen:
+                seen.add(normalized)
+                ordered.append(root)
+        return ordered
+
+    def _read_json_metadata_file(self, filename: str):
+        for root in self._metadata_search_roots():
+            path = root / filename
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, json.JSONDecodeError):
+                continue
+        return {}
+
+    def _current_file_start_mjd(self) -> float:
+        """Return the observation start MJD from obs_dict.json when available."""
+        if not self.files or self.index >= len(self.files):
+            return 0.0
+
+        obs_dict = self._read_json_metadata_file("obs_dict.json")
+        if not isinstance(obs_dict, dict):
+            return 0.0
+
+        stem = self.files[self.index].stem
+        match = re.search(r"(\d{5,})-(\d+)", stem)
+        if match is not None:
+            obs_key = match.group(1)
+            entry = obs_dict.get(obs_key)
+            if isinstance(entry, dict):
+                obs_start = entry.get("OBS_START")
+                if obs_start is not None:
+                    return float(obs_start)
+
+        match = re.search(r"(\d{5,})", stem)
+        if match is not None:
+            obs_key = match.group(1)
+            entry = obs_dict.get(obs_key)
+            if isinstance(entry, dict):
+                obs_start = entry.get("OBS_START")
+                if obs_start is not None:
+                    return float(obs_start)
+
+        return 0.0
+
+    def _current_fluxcal_toa(self) -> float:
+        """Return the exact fluxcal TOA using obs start MJD plus burst-local TOA in seconds."""
+        if not self.files or self.index >= len(self.files):
+            return 0.0
+
+        stem = self.files[self.index].stem
+        burst_match = re.search(r"(\d{5,})-(\d+)", stem)
+        if burst_match is None:
+            return 0.0
+
+        obs_key = burst_match.group(1)
+        burst_key = f"{obs_key}-{burst_match.group(2)}"
+
+        obs_dict = self._read_json_metadata_file("obs_dict.json")
+        burst_dict = self._read_json_metadata_file("burst_dict.json")
+
+        obs_entry = obs_dict.get(obs_key)
+        if isinstance(obs_entry, dict):
+            obs_start = obs_entry.get("OBS_START")
+        else:
+            obs_start = None
+
+        burst_entry = burst_dict.get(burst_key)
+        if isinstance(burst_entry, dict):
+            toa_seconds = burst_entry.get("TOA")
+        else:
+            toa_seconds = None
+
+        if obs_start is None or toa_seconds is None:
+            return 0.0
+
+        return float(obs_start) + float(toa_seconds) / 86400.0
 
     def _results_path(self) -> Optional[Path]:
         if self.directory is None:
@@ -1138,16 +1643,18 @@ class FRBViewer(QMainWindow):
         if path is None:
             return
 
+        payload = self._all_results if self._all_results else self.results
+        clean = self._clean_for_json(payload)
         try:
             path.write_text(
-                json.dumps(self.results, indent=2, allow_nan=False),
+                json.dumps(clean, indent=2, allow_nan=False),
                 encoding="utf-8",
             )
-        except ValueError:
-            # JSON does not permit NaN/Infinity. Convert non-finite floats.
-            clean = self._clean_for_json(self.results)
+        except (TypeError, ValueError):
+            # JSON serialization can still fail for odd objects; fall back to a
+            # fully normalized structure with NaN/Infinity converted away.
             path.write_text(
-                json.dumps(clean, indent=2),
+                json.dumps(self._clean_for_json(clean), indent=2),
                 encoding="utf-8",
             )
 
@@ -1157,9 +1664,138 @@ class FRBViewer(QMainWindow):
             return {k: FRBViewer._clean_for_json(v) for k, v in obj.items()}
         if isinstance(obj, list):
             return [FRBViewer._clean_for_json(v) for v in obj]
+        if isinstance(obj, tuple):
+            return [FRBViewer._clean_for_json(v) for v in obj]
+        if isinstance(obj, np.ndarray):
+            return [FRBViewer._clean_for_json(v) for v in obj.tolist()]
+        if isinstance(obj, np.generic):
+            value = obj.item()
+            if isinstance(value, float) and not np.isfinite(value):
+                return None
+            return value
         if isinstance(obj, float) and not np.isfinite(obj):
             return None
         return obj
+
+    def run_fluxcal(self):
+        if self.current_array is None:
+            return
+
+        if self.width_start is None or self.width_end is None:
+            QMessageBox.warning(
+                self,
+                "Fluxcal requires a selected width",
+                "Select the burst width before running Fluxcal.",
+            )
+            return
+
+        width_start = float(self.width_start)
+        width_end = float(self.width_end)
+        width_seconds = abs(width_end - width_start) * self.time_resolution * max(1, int(self.time_factor))
+        if width_seconds <= 0:
+            QMessageBox.warning(self, "Fluxcal failed", "Selected width is not positive.")
+            return
+
+        on_pulse_start = width_start * self.time_resolution * max(1, int(self.time_factor))
+        on_pulse_end = width_end * self.time_resolution * max(1, int(self.time_factor))
+
+        toa = self._current_fluxcal_toa()
+        if toa == 0.0:
+            start_mjd = self._current_file_start_mjd()
+            selection_start_seconds = width_start * self.time_resolution * max(1, int(self.time_factor))
+            if self._last_gaussian_fit and self._last_gaussian_fit.get("arrival_time") is not None:
+                toa = start_mjd + (float(self._last_gaussian_fit["arrival_time"]) / 86400.0)
+            else:
+                toa = start_mjd + (selection_start_seconds / 86400.0)
+            self.statusBar().showMessage(
+                "Fluxcal: no matching obs_dict/burst_dict TOA found; using an approximate "
+                "in-file TOA instead of the pipeline single-pulse TOA.",
+                8000,
+            )
+
+        try:
+            result = fluxcal(
+                self.current_array,
+                toa=toa,
+                width=width_seconds,
+                num_fwhms=3,
+                downsample_factor_time=max(1, int(self.time_factor)),
+                show_plot=True,
+                on_pulse_start=on_pulse_start,
+                on_pulse_end=on_pulse_end,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Fluxcal failed", str(exc))
+            return
+
+        self.processing_label.setText(f"Fluxcal result: {result:.6g} Jy·ms")
+        self.statusBar().showMessage(f"Fluxcal complete: {result:.6g} Jy·ms")
+
+    def export_fitburst_npz(self):
+        if self.current_array is None or self.directory is None:
+            return
+
+        self._save_current_state()
+
+        default_name = f"{self.files[self.index].stem}_fitburst_input.npz"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export fitburst-compatible .npz",
+            str(self.directory / default_name),
+            "NumPy archive (*.npz)",
+        )
+        if not path:
+            return
+
+        # Determine component list: prefer explicit components, then last fit, then selection
+        arrival_times: list[float] = []
+        widths_seconds: list[float] = []
+        amplitudes: list[float] = []
+
+        if self._components:
+            for c in self._components:
+                arrival_times.append(float(c["arrival_time"]))
+                widths_seconds.append(float(c["sigma_seconds"]))
+                amplitudes.append(float(c.get("amplitude", c.get("gaussian_fit", {}).get("amplitude", 1.0))))
+        elif self._last_gaussian_fit is not None:
+            arrival_times = [float(self._last_gaussian_fit.get("arrival_time", 0.0))]
+            widths_seconds = [float(self._last_gaussian_fit.get("sigma_seconds", 0.0))]
+            amplitudes = [float(self._last_gaussian_fit.get("amplitude", 1.0))]
+        else:
+            # Fallback to selection-based single component
+            if self.width_start is not None and self.width_end is not None:
+                widths_seconds = [abs(self.width_end - self.width_start) * self.time_resolution * max(1, int(self.time_factor))]
+                arrival_times = [float((self.width_start + self.width_end) / 2.0) * self.time_resolution * max(1, int(self.time_factor))]
+                amplitudes = [float(np.nanmax(self.current_array))]
+            else:
+                # no selection: single default
+                widths_seconds = [max(self.current_array.shape[1] * self.time_resolution, self.time_resolution)]
+                arrival_times = [0.0]
+                amplitudes = [float(np.nanmax(self.current_array))]
+
+        data_full, metadata, burst_parameters = build_fitburst_generic_input(
+            self.current_array,
+            dm=self.current_dm if self.current_dm is not None else 0.0,
+            res_time=self.time_resolution * max(1, int(self.time_factor)),
+            res_freq=self.freq_resolution * max(1, int(self.freq_factor)),
+            freqs_bin0=400.0,
+            bad_chans=[],
+            is_dedispersed=self.current_dm is not None,
+            arrival_time=arrival_times,
+            ref_freq=400.0,
+            width_seconds=widths_seconds,
+            amplitude=amplitudes,
+        )
+
+        np.savez(
+            path,
+            data_full=data_full,
+            metadata=metadata,
+            burst_parameters=burst_parameters,
+        )
+
+        self.processing_label.setText("fitburst .npz exported.")
+        self.statusBar().showMessage(f"fitburst input saved to {path}")
 
     def export_csv(self):
         if self.directory is None:
@@ -1234,10 +1870,36 @@ class FRBViewer(QMainWindow):
         else:
             self.band_label.setText("Bandwidth: —")
 
+        # Fit label: show TOA and width if available
+        fit = self._last_gaussian_fit
+        if fit is not None:
+            at = fit.get("arrival_time")
+            at_err = fit.get("arrival_time_err")
+            sig = fit.get("sigma_seconds")
+            sig_err = fit.get("sigma_seconds_err")
+            if at is not None and sig is not None:
+                at_ms = at * 1000.0
+                sig_ms = sig * 1000.0
+                txt = f"TOA: {at_ms:.4g} ms; Width(σ): {sig_ms:.4g} ms"
+                if at_err is not None:
+                    txt = f"TOA: {at_ms:.4g} ms ± {at_err*1000.0:.3g} ms; Width(σ): {sig_ms:.4g} ms"
+                if sig_err is not None:
+                    txt = txt.replace("ms", f"ms ± {sig_err*1000.0:.3g} ms", 1) if at_err is None else txt + f" ± {sig_err*1000.0:.3g} ms"
+                # Append component count if present
+                if self._components:
+                    txt = txt + f"; Components: {len(self._components)}"
+                self.fit_label.setText(txt)
+            else:
+                self.fit_label.setText("Fit: —")
+        else:
+            self.fit_label.setText("Fit: —")
+
     def _update_button_states(self):
         have_data = bool(self.files)
         self.previous_button.setEnabled(have_data and self.index > 0)
         self.next_button.setEnabled(have_data and self.index < len(self.files) - 1)
+        self.export_fitburst_button.setEnabled(have_data)
+        self.fluxcal_button.setEnabled(have_data)
 
     def closeEvent(self, event):
         self._save_current_state()
@@ -1245,10 +1907,22 @@ class FRBViewer(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="Browse FRB dynamic spectra.")
+    parser.add_argument("directory", nargs="?", default=None, help="Directory containing .npy burst files")
+    parser.add_argument(
+        "--no-bad",
+        action="store_true",
+        help="Load frb_viewer_results.json and exclude events whose note is 'bad'.",
+    )
+    parser.add_argument(
+        "--no-dups",
+        action="store_true",
+        help="Load frb_viewer_results.json and exclude events whose note is 'duplicate'.",
+    )
+    args = parser.parse_args()
 
-    directory = sys.argv[1] if len(sys.argv) > 1 else None
-    window = FRBViewer(directory)
+    app = QApplication(sys.argv)
+    window = FRBViewer(args.directory, no_bad=args.no_bad, no_dups=args.no_dups)
     window.show()
 
     sys.exit(app.exec())
